@@ -18,9 +18,10 @@ import sortednp as snp
 import cv2
 import pims
 
+proj_err = 4.0
+triang_params = TriangulationParameters(proj_err, 3.0, 0.1)
 
-proj_err = 3.0
-triang_params = TriangulationParameters(proj_err, 5.0, 0.5)
+init_pair_threshold = 1000
 
 
 def init_tracking(
@@ -28,36 +29,67 @@ def init_tracking(
         corner_storage,
         rgb_sequence: pims.FramesSequence
 ):
-    frame_1 = 0
-    view_mat_1 = eye3x4()
-    min_cos = 1
-    max_len_ps = 0
-    for i in range(1, len(rgb_sequence)):
-        corr = build_correspondences(corner_storage[frame_1], corner_storage[i])
-        if len(corr.ids) < 10:
-            continue
-        E, _ = cv2.findEssentialMat(
-            corr.points_1,
-            corr.points_2,
-            intrinsic_mat,
-            threshold=proj_err
-        )
-        _, R, t, _ = cv2.recoverPose(E, corr.points_1, corr.points_2)
-        view_mat_2 = np.hstack((R, -t))
-        points3d, ids, median_cos = triangulate_correspondences(
-            corr,
-            view_mat_1,
-            view_mat_2,
-            intrinsic_mat,
-            triang_params
-        )
-        min_cos = min(min_cos, median_cos)
-        max_len_ps = max(max_len_ps, len(points3d))
+    best_points_cnt = -1
+    best_pair = ((-1, None), (-1, None))
+    for frame1 in range(len(rgb_sequence)):
+        for frame2 in range(frame1 + 1, min(frame1 + 20, len(rgb_sequence))):
+            corrs = build_correspondences(corner_storage[frame1], corner_storage[frame2])
+            if len(corrs.ids) < 10:
+                continue
+            E, mask_em = cv2.findEssentialMat(
+                corrs.points_1,
+                corrs.points_2,
+                intrinsic_mat,
+                threshold=2.0,
+                method=cv2.RANSAC
+            )
 
-        if len(points3d) > 10:
-            return (frame_1, view_mat3x4_to_pose(view_mat_1)), (i, view_mat3x4_to_pose(view_mat_2))
+            if E is None:
+                continue
 
-    return None, None
+            corrs_mask = mask_em.astype(np.bool).flatten()
+            corrs = Correspondences(
+                corrs.ids[corrs_mask],
+                corrs.points_1[corrs_mask],
+                corrs.points_2[corrs_mask]
+            )
+
+            _, mask_hom = cv2.findHomography(
+                corrs.points_1,
+                corrs.points_2,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=2.0
+            )
+
+            if np.count_nonzero(mask_hom) / len(corrs.ids) > 0.5:
+                continue
+
+            R1, R2, t = cv2.decomposeEssentialMat(E)
+
+            poses = np.array([np.hstack((R, t)) for R, t in [(R1, t), (R1, -t), (R2, t), (R2, -t)]])
+
+            for view_mat_2 in poses:
+                view_mat_1 = eye3x4()
+
+                points3d, ids, median_cos = triangulate_correspondences(
+                    corrs,
+                    view_mat_1,
+                    view_mat_2,
+                    intrinsic_mat,
+                    triang_params
+                )
+                # min_cos = min(min_cos, median_cos)
+                # max_len_ps = max(max_len_ps, len(points3d))
+                cur_pair = (
+                        (frame1, view_mat3x4_to_pose(view_mat_1)),
+                        (frame2, view_mat3x4_to_pose(view_mat_2))
+                )
+                if len(points3d) > init_pair_threshold:
+                    return cur_pair
+                if len(points3d) > best_points_cnt:
+                    best_points_cnt = len(points3d)
+                    best_pair = cur_pair
+    return best_pair
 
 
 def print_proc_info(cur_frame, frame_cnt, inliers_cnt):
